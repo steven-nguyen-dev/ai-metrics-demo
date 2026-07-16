@@ -1,0 +1,185 @@
+# AI Contribution Report -- posts one coverage-style comment on each PR.
+# Copy to .github/workflows/ai-attribution.yml in your target repo.
+#
+# Mechanism, end to end:
+#   1. Check out the PR head commit with full git history (blame + merge-base
+#      need it -- a shallow clone can't walk back far enough).
+#   2. Fetch the PR's base branch too, since checkout only gives us the head ref.
+#   3. Run scripts/ai_attribution.py once (--format json). It git-blames every
+#      file changed in the PR, classifies each surviving line as AI or human
+#      based on which commit last touched it (see that script's docstring for
+#      the classifier), and returns both the rendered `markdown` comment body
+#      and a `label` for the PR in a single blame pass.
+#   4. Post the Markdown as a PR comment, editing our own previous comment in
+#      place on subsequent pushes instead of spamming new ones.
+#   5. Apply the AI-usage `label` to the PR, first stripping any stale label
+#      from the family (including labels from earlier schemes) so exactly one is
+#      present. The label is one of four AI-usage levels:
+#        ai-usage-low       -- AI wrote  0-29% of attributed lines
+#        ai-usage-med       -- AI wrote 30-59%
+#        ai-usage-high      -- AI wrote 60-79%
+#        ai-usage-optimal   -- AI wrote 80-100%
+#      The exact percentage lives in the PR comment; the label just carries the
+#      level so the repo's label catalog stays small and each level is filterable.
+#      Because this runs on every `synchronize`, the label is refreshed to match
+#      the latest push automatically.
+#
+# Config knobs (repo Settings -> Secrets and variables -> Actions -> Variables):
+#   AI_AUTHOR_REGEX  Optional. Overrides the script's default regex for
+#                    matching AI author/committer identity and Co-Authored-By
+#                    trailers (default covers claude, copilot, cursor, gemini,
+#                    "AI", "-agent", "[bot]", "bot@" -- case-insensitive).
+#                    Leave unset to use the script's built-in default.
+name: AI Contribution Report
+
+on:
+  # Re-run on every push to the PR (synchronize) as well as when it's first
+  # opened or reopened, so the comment always reflects the latest diff.
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+
+permissions:
+  contents: read          # only need to read code for checkout + blame
+  pull-requests: write    # post/update the report comment + label the PR
+  issues: write           # PR labels go through the issues API
+
+# Only the latest push to a PR matters -- this report always recomputes from
+# scratch. Cancel any run still in flight for the same PR so rapid pushes don't
+# pile up N parallel full-history checkouts (the expensive part on big repos).
+concurrency:
+  group: ai-attribution-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                       # blame + merge-base need history
+          # Partial clone: fetch the commit + tree graph (enough for merge-base
+          # and blame's history walk) but defer file blobs, which git fetches
+          # on demand during blame. On a large repo this cuts checkout time and
+          # disk sharply; the range-limited blame in ai_attribution.py keeps the
+          # on-demand blob fetches small (only the PR's commits are walked).
+          filter: blob:none
+          ref: ${{ github.event.pull_request.head.sha }}  # pin to the exact PR head, not a merge ref
+
+      - name: Fetch base branch
+        # actions/checkout above only brings down the head ref's history.
+        # We need the base branch locally too so `git merge-base` and
+        # `git diff` (both run inside ai_attribution.py) have something to
+        # compare against.
+        run: git fetch --no-tags origin ${{ github.event.pull_request.base.ref }}
+
+      - name: Compute report
+        id: report
+        env:
+          # Optional: override the regex to match bot author names/emails (e.g., gemini, claude, ai).
+          # Read by ai_attribution.py via os.environ; falls back to its
+          # built-in default_ai_regex when this variable is unset/blank.
+          AI_AUTHOR_REGEX: ${{ vars.AI_AUTHOR_REGEX }}
+        run: |
+          # --base/--head define the commit range the script inspects (it
+          # internally computes their merge-base so a stale base branch
+          # doesn't inflate the diff). --format json returns the comment body
+          # (`markdown`) and the PR label (`label`) together, so one blame pass
+          # feeds both the comment and the labeling step below.
+          python3 scripts/ai_attribution.py \
+            --base origin/${{ github.event.pull_request.base.ref }} \
+            --head ${{ github.event.pull_request.head.sha }} \
+            --format json > report.json
+          jq -r '.markdown' report.json > report.md
+          cat report.md
+          # Expose the label (empty string when the script returned null, i.e.
+          # nothing to attribute) as a step output for the labeling step.
+          echo "label=$(jq -r '.label // empty' report.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Post / update PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Hidden marker used only to find & update our own comment
+          # (so pushes update one comment instead of spamming new ones).
+          MARK="<!-- ai-contribution-report -->"
+          BODY="${MARK}"$'\n'"$(cat report.md)"
+          # Look for an existing comment carrying our marker; reuse its id if
+          # found (PATCH = update), otherwise POST a brand new comment.
+          CID=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+            --jq '.[] | select(.body | contains("ai-contribution-report")) | .id' \
+            | head -n1)
+          if [ -n "$CID" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${CID}" \
+              -f body="$BODY" >/dev/null
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR}/comments" \
+              -f body="$BODY" >/dev/null
+          fi
+
+      - name: Apply AI-attribution label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ steps.report.outputs.label }}
+        run: |
+          # Our label family: exactly one should be on the PR at a time. Every
+          # run first strips any of ours that isn't the current target (e.g. a
+          # stale ai-assisted-70 after the number moves, or ai-author flipping
+          # to ai-assisted-* once a human edits a line), then applies the
+          # current one -- so the label always tracks the latest push.
+          # Matches the current ai-usage-* family AND labels from earlier schemes
+          # (ai-assisted-*, ai-author, human-author) so a PR carrying an old
+          # label sheds it and picks up the new level on the next run.
+          is_ours() {
+            case "$1" in
+              ai-usage-*|ai-assisted-*|ai-author|human-author) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # Strip stale family labels. --paginate in case the PR has many labels.
+          gh api "repos/${REPO}/issues/${PR}/labels" --paginate --jq '.[].name' \
+          | while IFS= read -r name; do
+              [ -z "$name" ] && continue
+              if is_ours "$name" && [ "$name" != "$LABEL" ]; then
+                enc=$(jq -rn --arg n "$name" '$n|@uri')
+                gh api -X DELETE "repos/${REPO}/issues/${PR}/labels/${enc}" >/dev/null 2>&1 || true
+              fi
+            done
+
+          # Empty label = nothing to attribute (script returned null) -> leave
+          # the PR unlabeled after the strip above.
+          if [ -z "$LABEL" ]; then
+            echo "No attributable lines; PR left unlabeled."
+            exit 0
+          fi
+
+          # Colour per level: a sequential ramp that climbs to a vivid green at
+          # "optimal" -- violet -> blue -> teal -> green. GitHub dark mode renders
+          # labels as bright accents, so these mid-vivid jewel tones pop (near-
+          # black shades go muddy there); the ordered ramp lets a PR's AI-usage
+          # level read at a glance, with the target state standing out.
+          case "$LABEL" in
+            ai-usage-low)      COLOR=7B61C9; DESC="AI usage: low -- AI wrote 0-29% of attributed PR lines" ;;
+            ai-usage-med)      COLOR=3B82D9; DESC="AI usage: medium -- AI wrote 30-59% of attributed PR lines" ;;
+            ai-usage-high)     COLOR=2AA594; DESC="AI usage: high -- AI wrote 60-79% of attributed PR lines" ;;
+            ai-usage-optimal)  COLOR=41C363; DESC="AI usage: optimal -- AI wrote 80-100% of attributed PR lines" ;;
+          esac
+
+          # Ensure the label exists with the current colour/description. Create
+          # it; if it already exists (POST 422), PATCH instead so palette or
+          # wording changes propagate to labels created by earlier runs.
+          enc=$(jq -rn --arg n "$LABEL" '$n|@uri')
+          if ! jq -n --arg n "$LABEL" --arg c "$COLOR" --arg d "$DESC" \
+                    '{name:$n, color:$c, description:$d}' \
+               | gh api -X POST "repos/${REPO}/labels" --input - >/dev/null 2>&1; then
+            jq -n --arg c "$COLOR" --arg d "$DESC" '{color:$c, description:$d}' \
+              | gh api -X PATCH "repos/${REPO}/labels/${enc}" --input - >/dev/null 2>&1 || true
+          fi
+          # Add it to the PR (idempotent -- a no-op if already present).
+          jq -n --arg n "$LABEL" '{labels:[$n]}' \
+            | gh api -X POST "repos/${REPO}/issues/${PR}/labels" --input - >/dev/null
+          echo "Applied label: $LABEL"

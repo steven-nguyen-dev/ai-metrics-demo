@@ -1,0 +1,55 @@
+# -----------------------
+# Gradle
+# -----------------------
+.gradle/
+build/
+**/build/
+
+# Gradle wrapper (keep jar)
+!gradle/wrapper/gradle-wrapper.jar
+
+# -----------------------
+# IntelliJ
+# -----------------------
+.idea/
+# Ignore .claude/ contents but keep the shared, checked-in project settings
+# (auto-commit hook) tracked; personal overrides (settings.local.json) stay
+# ignored. Note: must exclude the dir *contents* (.claude/*), not the dir
+# itself -- git can't re-include a file whose parent directory is excluded.
+.claude/*
+!.claude/settings.json
+*.iml
+*.ipr
+*.iws
+out/
+.docs/notes/personal/
+# -----------------------
+# Logs
+# -----------------------
+*.log
+
+# -----------------------
+# OS files
+# -----------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------
+# Env / local configs
+# -----------------------
+.env
+.env.*
+application-local.yml
+application-dev.yml
+
+# -----------------------
+# Java crash logs
+# -----------------------
+hs_err_pid*
+replay_pid*
+
+# -----------------------
+# WireGuard runtime config
+# -----------------------
+infra/docker/wireguard/config/*
+!infra/docker/wireguard/config/wg0.conf
