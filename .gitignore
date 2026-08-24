@@ -18,6 +18,8 @@ build/
 # itself -- git can't re-include a file whose parent directory is excluded.
 .claude/*
 !.claude/settings.json
+!.claude/skills/
+!.claude/skills/**
 *.iml
 *.ipr
 *.iws
@@ -39,6 +41,7 @@ Thumbs.db
 # -----------------------
 .env
 .env.*
+!.env.example
 application-local.yml
 application-dev.yml
 
