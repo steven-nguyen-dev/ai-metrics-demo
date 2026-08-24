@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "jira": {
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/scripts/mcps/jira/server.py"
+      ]
+    }
+  }
+}
